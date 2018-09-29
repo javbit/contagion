@@ -1,0 +1,6 @@
+[package]
+name = "contagion"
+version = "0.1.0"
+authors = ["Javed Mohamed <javbit@disroot.org>"]
+
+[dependencies]
