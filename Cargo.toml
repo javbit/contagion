@@ -4,3 +4,4 @@ version = "0.1.0"
 authors = ["Javed Mohamed <javbit@disroot.org>"]
 
 [dependencies]
+tokio = "0.1"
