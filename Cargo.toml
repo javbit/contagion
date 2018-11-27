@@ -4,3 +4,8 @@ version = "0.1.0"
 authors = ["Javed Mohamed <javbit@disroot.org>"]
 
 [dependencies]
+clap = "2.32"
+bytes = "0.4"
+futures = "0.1"
+tokio = "0.1"
+tokio-io = "0.1"
