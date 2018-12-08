@@ -9,10 +9,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 /// Shorthand for the transmit half of the message channel.
-type Tx = mpsc::UnboundedSender<Bytes>;
+pub type Tx = mpsc::UnboundedSender<Bytes>;
 
 /// Shorthand for the receive half of the message channel.
-type Rx = mpsc::UnboundedReceiver<Bytes>;
+pub type Rx = mpsc::UnboundedReceiver<Bytes>;
 
 /// Data that is shared between all peers in the chat server.
 ///
@@ -51,6 +51,48 @@ struct Peer {
     /// address is saved so that the `Peer` drop implementation can clean up its
     /// entry.
     addr: SocketAddr,
+}
+
+/// Struct representing user input and output
+pub struct User {
+    state: Arc<Mutex<Shared>>,
+    input: Rx,
+    output: Tx,
+}
+
+impl User {
+    fn new(state: Arc<Mutex<Shared>>, input: Rx, output: Tx) -> Self {
+        Self {
+            state,
+            input,
+            output,
+        }
+    }
+
+    fn send_message(&self, message: Bytes) {
+        self.output.unbounded_send(message).unwrap();
+    }
+}
+
+impl Future for User {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        const MESSAGES_PER_TICK: usize = 5;
+        for i in 0..MESSAGES_PER_TICK {
+            if let Async::Ready(Some(v)) = self.input.poll().unwrap() {
+                for (_, tx) in &self.state.lock().unwrap().peers {
+                    tx.unbounded_send(v.clone()).unwrap();
+                }
+                if i + 1 == MESSAGES_PER_TICK {
+                    task::current().notify();
+                }
+                return Ok(Async::Ready(()));
+            }
+        }
+        Ok(Async::NotReady)
+    }
 }
 
 /// Message based codec
@@ -161,8 +203,6 @@ impl Future for Peer {
 
         // Read new messages from the socket
         while let Async::Ready(message) = self.messages.poll()? {
-            println!("Received message: {:?}", message);
-
             if let Some(message) = message {
                 let mut message = message.clone();
                 message.extend_from_slice(b"\r\n");
@@ -188,6 +228,7 @@ impl Future for Peer {
             } else {
                 // EOF was reached. The remote client has disconnected. There is
                 // nothing more to do.
+                println!("Disconnected");
                 return Ok(Async::Ready(()));
             }
         }
@@ -329,7 +370,15 @@ fn process(socket: TcpStream, state: Arc<Mutex<Shared>>) {
     tokio::spawn(connection);
 }
 
-pub fn reactor() {
+pub fn reactor(
+    // user_input: mpsc::UnboundedReceiver<String>,
+    // user_messages: mpsc::UnboundedSender<String>,
+    addr: String,
+    port: String,
+    bootstrap: String,
+    user_input: Rx,
+    user_output: Tx,
+) {
     // Create the shared state. This is how all the peers communicate.
     //
     // The server task will hold a handle to this. For every new client, the
@@ -337,19 +386,12 @@ pub fn reactor() {
     // client connection.
     let state = Arc::new(Mutex::new(Shared::new()));
 
-    // Get IP address to use (default to 127.0.0.1).
-    let mut addr = String::new();
-    println!("Enter address to use (default: localhost)");
-    let _ = std::io::stdin().read_line(&mut addr);
+    let user = User::new(state.clone(), user_input, user_output);
+
     let addr = addr
         .trim()
         .parse::<Ipv4Addr>()
         .unwrap_or(Ipv4Addr::LOCALHOST);
-
-    // Get port number (default to 6142)
-    let mut port = String::new();
-    println!("Enter port to use (default: 6142)");
-    let _ = std::io::stdin().read_line(&mut port);
     let port = port.trim().parse::<u16>().unwrap_or(6142);
 
     let addr = SocketAddr::new(IpAddr::V4(addr), port);
@@ -359,10 +401,6 @@ pub fn reactor() {
     // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&addr).unwrap();
 
-    // Get bootstrap node (optional)
-    let mut bootstrap = String::new();
-    println!("Enter bootstrap node address (optional)");
-    let _ = std::io::stdin().read_line(&mut bootstrap);
     let bootstrap = bootstrap.trim().parse::<SocketAddr>();
 
     // Future for adding a bootstrap node.
