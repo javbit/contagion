@@ -1,0 +1,555 @@
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+
+use self::cursor::CursorSet;
+use text_ui::buffer::Buffer;
+use text_ui::formatter::LineFormatter;
+use text_ui::formatter::RoundingBehavior::*;
+use std::cmp::{max, min};
+use std::path::{Path, PathBuf};
+use text_ui::string_utils::{char_count, rope_slice_to_line_ending, LineEnding};
+use text_ui::utils::{digit_count, RopeGraphemes};
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::sync::mpsc;
+
+mod cursor;
+
+
+/// Shorthand for the transmit half of the message channel.
+pub type Tx = mpsc::UnboundedSender<Bytes>;
+
+/// Shorthand for the receive half of the message channel.
+pub type Rx = mpsc::UnboundedReceiver<Bytes>;
+
+
+pub struct Editor<T: LineFormatter> {
+    pub buffer: Buffer,
+    pub received: Buffer,
+    pub messages: Buffer,
+    pub formatter: T,
+    pub file_path: PathBuf,
+    pub line_ending_type: LineEnding,
+    pub soft_tabs: bool,
+    pub soft_tab_width: u8,
+    pub dirty: bool,
+    pub sent_msg: bool,
+    pub display_received: bool,
+    pub display_all: bool,
+    pub sending_channel: Tx,
+    pub receiving_channel: Rx,
+    pub all_messages: PathBuf,
+
+    // The dimensions of the total editor in screen space, including the
+    // header, gutter, etc.
+    pub editor_dim: (usize, usize),
+
+    // The dimensions and position of just the text view portion of the editor
+    pub view_dim: (usize, usize), // (height, width)
+    pub view_pos: (usize, usize), // (char index, visual horizontal offset)
+
+    // The editing cursor position
+    pub cursors: CursorSet,
+}
+
+impl<T: LineFormatter> Editor<T> {
+    /// Create a new blank editor
+    // pub fn new(formatter: T, sending_channel: Tx, receiving_channel: Rx, all_messages: PathBuf) -> Editor<T> {
+    //     Editor {
+    //         buffer: Buffer::new(),
+    //         received: Buffer::new(),
+    //         messages: Buffer::new(),
+    //         formatter: formatter,
+    //         file_path: PathBuf::new(),
+    //         line_ending_type: LineEnding::LF,
+    //         soft_tabs: false,
+    //         soft_tab_width: 4,
+    //         dirty: false,
+    //         sent_msg: false,
+    //         editor_dim: (0, 0),
+    //         view_dim: (0, 0),
+    //         view_pos: (0, 0),
+    //         cursors: CursorSet::new(),
+    //         display_received: false,
+    //         display_all: true,
+    //         sending_channel: sending_channel,
+    //         receiving_channel: receiving_channel,
+    //         all_messages: all_messages,
+    //     }
+    // }
+
+    pub fn new_from_file(formatter: T, path: &Path, sending_channel: Tx, receiving_channel: Rx, all_messages: &Path) -> Editor<T> {
+        let buf = match Buffer::new_from_file(path) {
+            Ok(b) => b,
+            // TODO: handle un-openable file better
+
+            _ => panic!("Could not open file!"),
+        };
+
+
+        let mut ed = Editor {
+            buffer: buf,
+            received: Buffer::new(),
+            messages: Buffer::new(),
+            formatter: formatter,
+            file_path: path.to_path_buf(),
+            line_ending_type: LineEnding::LF,
+            soft_tabs: false,
+            soft_tab_width: 4,
+            dirty: false,
+            sent_msg: false,
+            editor_dim: (0, 0),
+            view_dim: (0, 0),
+            view_pos: (0, 0),
+            cursors: CursorSet::new(),
+            display_received: false,
+            display_all: false,
+            sending_channel: sending_channel,
+            receiving_channel: receiving_channel,
+            all_messages: all_messages.to_path_buf(),
+        };
+
+        return ed;
+    }
+
+    pub fn save_if_dirty(&mut self) {
+        if self.dirty && self.file_path != PathBuf::new() {
+            let _ = self.buffer.save_to_file(&self.file_path);
+            self.dirty = false;
+        }
+    }
+
+    pub fn send_message(&mut self) {
+        if self.file_path != PathBuf::new() {
+            let _ = self.buffer.send_message(&self.file_path, &self.sending_channel);
+            self.sent_msg = true;
+            self.editor_dim = (0, 0);
+            self.view_dim = (0, 0);
+            self.view_pos = (0, 0);
+            self.cursors = CursorSet::new();
+        }
+    }
+
+    pub fn reset_send_message(&mut self) {
+        self.sent_msg = false;
+    }
+
+    pub fn display_all_messages(&mut self) {
+        if self.file_path != PathBuf::new() {
+            self.buffer = Buffer::new();
+
+            self.editor_dim = (0, 0);
+            self.view_dim = (0, 0);
+            self.view_pos = (0, 0);
+            self.cursors = CursorSet::new();
+            self.display_all = false;
+        }
+    }
+
+
+    pub fn display_write_messages(&mut self) {
+        if self.file_path != PathBuf::new() {
+            self.buffer = Buffer::load_received(&self.all_messages, &mut self.receiving_channel);
+
+            self.editor_dim = (0, 0);
+            self.view_dim = (0, 0);
+            self.view_pos = (0, 0);
+            self.cursors = CursorSet::new();
+            self.display_all = true;
+        }
+    }
+
+    /// Updates the view dimensions, and returns whether that
+    /// actually changed anything.
+    pub fn update_dim(&mut self, h: usize, w: usize) -> bool {
+        let line_count_digits = digit_count(self.buffer.line_count() as u32, 10) as usize;
+        if self.editor_dim.0 != h || self.editor_dim.1 != w {
+            self.editor_dim = (h, w);
+
+            // Minus 1 vertically for the header, minus one more than the digits in
+            // the line count for the gutter.
+            self.view_dim = (
+                self.editor_dim.0 - 1,
+                self.editor_dim.1 - line_count_digits - 1,
+            );
+            return true;
+        } else if self.view_dim.1 != (self.editor_dim.1 - line_count_digits - 1) {
+            self.view_dim.1 = self.editor_dim.1 - line_count_digits - 1;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// Moves the editor's view the minimum amount to show the cursor
+    pub fn move_view_to_cursor(&mut self) {
+        // TODO: account for the horizontal offset of the editor view.
+
+        // TODO: handle multiple cursors properly.  Should only move if
+        // there are no cursors currently in view, and should jump to
+        // the closest cursor.
+
+        // Find the first and last char index visible within the editor.
+        let c_first =
+            self.formatter
+                .index_set_horizontal_v2d(&self.buffer, self.view_pos.0, 0, Floor);
+        let mut c_last = self.formatter.index_offset_vertical_v2d(
+            &self.buffer,
+            c_first,
+            self.view_dim.0 as isize,
+            (Floor, Floor),
+        );
+        c_last =
+            self.formatter
+                .index_set_horizontal_v2d(&self.buffer, c_last, self.view_dim.1, Floor);
+
+        // Adjust the view depending on where the cursor is
+        if self.cursors[0].range.0 < c_first {
+            self.view_pos.0 = self.cursors[0].range.0;
+        } else if self.cursors[0].range.0 > c_last {
+            self.view_pos.0 = self.formatter.index_offset_vertical_v2d(
+                &self.buffer,
+                self.cursors[0].range.0,
+                -(self.view_dim.0 as isize),
+                (Floor, Floor),
+            );
+        }
+    }
+
+    pub fn insert_text_at_cursor(&mut self, text: &str) {
+        self.cursors.make_consistent();
+
+        let str_len = char_count(text);
+        let mut offset = 0;
+
+        for c in self.cursors.iter_mut() {
+            // Insert text
+            self.buffer.insert_text(text, c.range.0 + offset);
+            self.dirty = true;
+
+            // Move cursor
+            c.range.0 += str_len + offset;
+            c.range.1 += str_len + offset;
+            c.update_vis_start(&(self.buffer), &(self.formatter));
+
+            // Update offset
+            offset += str_len;
+        }
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn insert_tab_at_cursor(&mut self) {
+        self.cursors.make_consistent();
+
+        if self.soft_tabs {
+            let mut offset = 0;
+
+            for c in self.cursors.iter_mut() {
+                // Update cursor with offset
+                c.range.0 += offset;
+                c.range.1 += offset;
+
+                // Figure out how many spaces to insert
+                let vis_pos = self
+                    .formatter
+                    .index_to_horizontal_v2d(&self.buffer, c.range.0);
+                // TODO: handle tab settings
+                let next_tab_stop =
+                    ((vis_pos / self.soft_tab_width as usize) + 1) * self.soft_tab_width as usize;
+                let space_count = min(next_tab_stop - vis_pos, 8);
+
+                // Insert spaces
+                let space_strs = [
+                    "", " ", "  ", "   ", "    ", "     ", "      ", "       ", "        ",
+                ];
+                self.buffer.insert_text(space_strs[space_count], c.range.0);
+                self.dirty = true;
+
+                // Move cursor
+                c.range.0 += space_count;
+                c.range.1 += space_count;
+                c.update_vis_start(&(self.buffer), &(self.formatter));
+
+                // Update offset
+                offset += space_count;
+            }
+
+            // Adjust view
+            self.move_view_to_cursor();
+        } else {
+            self.insert_text_at_cursor("\t");
+        }
+    }
+
+    pub fn backspace_at_cursor(&mut self) {
+        self.remove_text_behind_cursor(1);
+    }
+
+    pub fn remove_text_behind_cursor(&mut self, grapheme_count: usize) {
+        self.cursors.make_consistent();
+
+        let mut offset = 0;
+
+        for c in self.cursors.iter_mut() {
+            // Update cursor with offset
+            c.range.0 -= offset;
+            c.range.1 -= offset;
+
+            // Do nothing if there's nothing to delete.
+            if c.range.0 == 0 {
+                continue;
+            }
+
+            let len = c.range.0 - self.buffer.nth_prev_grapheme(c.range.0, grapheme_count);
+
+            // Remove text
+            self.buffer.remove_text_before(c.range.0, len);
+            self.dirty = true;
+
+            // Move cursor
+            c.range.0 -= len;
+            c.range.1 -= len;
+            c.update_vis_start(&(self.buffer), &(self.formatter));
+
+            // Update offset
+            offset += len;
+        }
+
+        self.cursors.make_consistent();
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn remove_text_in_front_of_cursor(&mut self, grapheme_count: usize) {
+        self.cursors.make_consistent();
+
+        let mut offset = 0;
+
+        for c in self.cursors.iter_mut() {
+            // Update cursor with offset
+            c.range.0 -= min(c.range.0, offset);
+            c.range.1 -= min(c.range.1, offset);
+
+            // Do nothing if there's nothing to delete.
+            if c.range.1 == self.buffer.char_count() {
+                return;
+            }
+
+            let len = self.buffer.nth_next_grapheme(c.range.1, grapheme_count) - c.range.1;
+
+            // Remove text
+            self.buffer.remove_text_after(c.range.1, len);
+            self.dirty = true;
+
+            // Move cursor
+            c.update_vis_start(&(self.buffer), &(self.formatter));
+
+            // Update offset
+            offset += len;
+        }
+
+        self.cursors.make_consistent();
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn remove_text_inside_cursor(&mut self) {
+        self.cursors.make_consistent();
+
+        let mut offset = 0;
+
+        for c in self.cursors.iter_mut() {
+            // Update cursor with offset
+            c.range.0 -= min(c.range.0, offset);
+            c.range.1 -= min(c.range.1, offset);
+
+            // If selection, remove text
+            if c.range.0 < c.range.1 {
+                let len = c.range.1 - c.range.0;
+
+                self.buffer
+                    .remove_text_before(c.range.0, c.range.1 - c.range.0);
+                self.dirty = true;
+
+                // Move cursor
+                c.range.1 = c.range.0;
+
+                // Update offset
+                offset += len;
+            }
+
+            c.update_vis_start(&(self.buffer), &(self.formatter));
+        }
+
+        self.cursors.make_consistent();
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn cursor_to_beginning_of_buffer(&mut self) {
+        self.cursors = CursorSet::new();
+
+        self.cursors[0].range = (0, 0);
+        self.cursors[0].update_vis_start(&(self.buffer), &(self.formatter));
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn cursor_to_end_of_buffer(&mut self) {
+        let end = self.buffer.char_count();
+
+        self.cursors = CursorSet::new();
+        self.cursors[0].range = (end, end);
+        self.cursors[0].update_vis_start(&(self.buffer), &(self.formatter));
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn cursor_left(&mut self, n: usize) {
+        for c in self.cursors.iter_mut() {
+            c.range.0 = self.buffer.nth_prev_grapheme(c.range.0, n);
+            c.range.1 = c.range.0;
+            c.update_vis_start(&(self.buffer), &(self.formatter));
+        }
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn cursor_right(&mut self, n: usize) {
+        for c in self.cursors.iter_mut() {
+            c.range.1 = self.buffer.nth_next_grapheme(c.range.1, n);
+            c.range.0 = c.range.1;
+            c.update_vis_start(&(self.buffer), &(self.formatter));
+        }
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn cursor_up(&mut self, n: usize) {
+        for c in self.cursors.iter_mut() {
+            let vmove = -1 * (n * self.formatter.single_line_height()) as isize;
+
+            let mut temp_index = self.formatter.index_offset_vertical_v2d(
+                &self.buffer,
+                c.range.0,
+                vmove,
+                (Round, Round),
+            );
+            temp_index = self.formatter.index_set_horizontal_v2d(
+                &self.buffer,
+                temp_index,
+                c.vis_start,
+                Round,
+            );
+
+            if !self.buffer.is_grapheme(temp_index) {
+                temp_index = self.buffer.nth_prev_grapheme(temp_index, 1);
+            }
+
+            if temp_index == c.range.0 {
+                // We were already at the top.
+                c.range.0 = 0;
+                c.range.1 = 0;
+                c.update_vis_start(&(self.buffer), &(self.formatter));
+            } else {
+                c.range.0 = temp_index;
+                c.range.1 = temp_index;
+            }
+        }
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn cursor_down(&mut self, n: usize) {
+        for c in self.cursors.iter_mut() {
+            let vmove = (n * self.formatter.single_line_height()) as isize;
+
+            let mut temp_index = self.formatter.index_offset_vertical_v2d(
+                &self.buffer,
+                c.range.0,
+                vmove,
+                (Round, Round),
+            );
+            temp_index = self.formatter.index_set_horizontal_v2d(
+                &self.buffer,
+                temp_index,
+                c.vis_start,
+                Round,
+            );
+
+            if !self.buffer.is_grapheme(temp_index) {
+                temp_index = self.buffer.nth_prev_grapheme(temp_index, 1);
+            }
+
+            if temp_index == c.range.0 {
+                // We were already at the bottom.
+                c.range.0 = self.buffer.char_count();
+                c.range.1 = self.buffer.char_count();
+                c.update_vis_start(&(self.buffer), &(self.formatter));
+            } else {
+                c.range.0 = temp_index;
+                c.range.1 = temp_index;
+            }
+        }
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn page_up(&mut self) {
+        let move_amount =
+            self.view_dim.0 - max(self.view_dim.0 / 8, self.formatter.single_line_height());
+        self.view_pos.0 = self.formatter.index_offset_vertical_v2d(
+            &self.buffer,
+            self.view_pos.0,
+            -1 * move_amount as isize,
+            (Round, Round),
+        );
+
+        self.cursor_up(move_amount);
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn page_down(&mut self) {
+        let move_amount =
+            self.view_dim.0 - max(self.view_dim.0 / 8, self.formatter.single_line_height());
+        self.view_pos.0 = self.formatter.index_offset_vertical_v2d(
+            &self.buffer,
+            self.view_pos.0,
+            move_amount as isize,
+            (Round, Round),
+        );
+
+        self.cursor_down(move_amount);
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+
+    pub fn jump_to_line(&mut self, n: usize) {
+        let pos = self.buffer.line_col_to_index((n, 0));
+        self.cursors.truncate(1);
+        self.cursors[0].range.0 = self.formatter.index_set_horizontal_v2d(
+            &self.buffer,
+            pos,
+            self.cursors[0].vis_start,
+            Round,
+        );
+        self.cursors[0].range.1 = self.cursors[0].range.0;
+
+        // Adjust view
+        self.move_view_to_cursor();
+    }
+}
