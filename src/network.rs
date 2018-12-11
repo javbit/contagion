@@ -22,6 +22,7 @@ pub type Rx = mpsc::UnboundedReceiver<Bytes>;
 /// `Tx`.
 struct Shared {
     peers: HashMap<SocketAddr, Tx>,
+    user: Tx,
 }
 
 /// The state for each connected client.
@@ -57,26 +58,17 @@ struct Peer {
 pub struct User {
     state: Arc<Mutex<Shared>>,
     input: Rx,
-    output: Tx,
 }
 
 impl User {
-    fn new(state: Arc<Mutex<Shared>>, input: Rx, output: Tx) -> Self {
-        Self {
-            state,
-            input,
-            output,
-        }
-    }
-
-    fn send_message(&self, message: Bytes) {
-        self.output.unbounded_send(message).unwrap();
+    fn new(state: Arc<Mutex<Shared>>, input: Rx) -> Self {
+        Self { state, input }
     }
 }
 
 impl Future for User {
     type Item = ();
-    type Error = io::Error;
+    type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         const MESSAGES_PER_TICK: usize = 5;
@@ -118,9 +110,10 @@ struct Messages {
 
 impl Shared {
     /// Create a new, empty, instance of `Shared`.
-    fn new() -> Self {
+    fn new(user: Tx) -> Self {
         Shared {
             peers: HashMap::new(),
+            user,
         }
     }
 }
@@ -225,6 +218,13 @@ impl Future for Peer {
                         tx.unbounded_send(message.clone()).unwrap();
                     }
                 }
+                &self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .user
+                    .unbounded_send(message.clone())
+                    .unwrap();
             } else {
                 // EOF was reached. The remote client has disconnected. There is
                 // nothing more to do.
@@ -384,9 +384,11 @@ pub fn reactor(
     // The server task will hold a handle to this. For every new client, the
     // `state` handle is cloned and passed into the task that processes the
     // client connection.
-    let state = Arc::new(Mutex::new(Shared::new()));
+    let state = Arc::new(Mutex::new(Shared::new(user_output)));
 
-    let user = User::new(state.clone(), user_input, user_output);
+    let user = User::new(state.clone(), user_input);
+    let user = futures::future::ok::<(), ()>(())
+        .map(|_| tokio::spawn(user));
 
     let addr = addr
         .trim()
@@ -436,5 +438,5 @@ pub fn reactor(
     //
     // This runs the given future, which first adds the bootstrap node (if any)
     // to the peers list. Then it starts the server.
-    tokio::run(add_bootstrap.then(|_| server));
+    tokio::run(add_bootstrap.then(|_| user).then(|_| server));
 }
