@@ -8,8 +8,17 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 
+extern crate docopt;
+extern crate ropey;
+extern crate smallvec;
+extern crate termion;
+extern crate unicode_segmentation;
+extern crate unicode_width;
+
+
 mod network;
 mod message;
+mod text_ui;
 
 use std::thread;
 
@@ -31,18 +40,34 @@ fn main() {
     println!("Enter bootstrap node address (optional)");
     let _ = std::io::stdin().read_line(&mut bootstrap);
 
+    // Get filename for writing
+    let mut filename = String::new();
+    println!("Enter filename for writing messages");
+    let _ = std::io::stdin().read_line(&mut filename);
+    filename.pop();
+
+    // Get filename for storing all messages
+    let mut all_messages = String::new();
+    println!("Enter filename for storing all messages");
+    let _ = std::io::stdin().read_line(&mut all_messages);
+    all_messages.pop();
+
     // Create channels.
     let (ui_msg_send, user_input) = mpsc::unbounded();
     let (user_output, ui_msg_recv) = mpsc::unbounded();
 
-    let node = thread::spawn(|| network::reactor(
+    // Spawn thread for networking.
+    let node_network = thread::spawn(|| network::reactor(
         addr,
         port,
         bootstrap,
         user_input,
         user_output
     ));
+
     println!("Multi-threaded!");
-    // TODO: Start UI process here. Can remove `join` then.
-    node.join().expect("Spawn has panicked!");
+
+    text_ui::start_ui(ui_msg_send, ui_msg_recv, filename, all_messages);
+
+    node_network.join().expect("Spawn has panicked!");
 }
